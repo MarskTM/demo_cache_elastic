@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"math/rand"
 	"time"
@@ -27,38 +26,43 @@ func init() {
 
 func main() {
 	// migrate dữ liệu
-	// LoadAllData()
+	LoadAllData()
 
-	fmt.Println("----------------------- Get Filter Data ----------------------------")
-	_, total, err := elaC.SelectListAdmins(context.Background(), 1001, 10000, 0)
-	if err != nil {
-		fmt.Println("err get list: ", err)
-	}
-	fmt.Println("Get all Admin Total: ", total)
-	// fmt.Println("Get all Admin: ", *getData)
+	// Lấy dữ liệu
+	GetData()
 
-	_, ok := redisC.GetList(channelID)
-	if !ok {
-		fmt.Println("err get list!")
-	}
+	// fmt.Println("----------------------- Get Filter Data ----------------------------")
+	// _, total, err := elaC.SelectListAdmins(context.Background(), 1001, 10000, 0)
+	// if err != nil {
+	// 	fmt.Println("err get list: ", err)
+	// }
+	// fmt.Println("Get all Admin Total: ", total)
+	// // fmt.Println("Get all Admin: ", *getData)
 
-	redisC.GetString(channelID)
-	// fmt.Println("Get all listID: ", listID)
+	// _, ok := redisC.GetList(channelID)
+	// if !ok {
+	// 	fmt.Println("err get list!")
+	// }
+
+	// redisC.GetString(channelID)
+	// // fmt.Println("Get all listID: ", listID)
+
+	// AddUsser()
 }
 
 // ===================================================================================
 // sampleData tạo ra 10 documents mẫu
-func sampleData(channelID int32, size int, idStart int) ([]repo.ElasticUserChannleParticipantsDO, []int32) {
+func sampleData(channelID int32, size int, idStart int) ([]repo.ElasticChannelParticipantsDO, []int32) {
 	now := int32(time.Now().Unix())
 
-	data := []repo.ElasticUserChannleParticipantsDO{}
+	data := []repo.ElasticChannelParticipantsDO{}
 	litsUserID := []int32{}
 
 	for i := idStart; i <= size; i++ {
-		doc := &repo.ElasticUserChannleParticipantsDO{
+		doc := &repo.ElasticChannelParticipantsDO{
 			ID:                int64(i),
 			ChannelID:         channelID,
-			UserID:            int64(i),
+			UserID:            int32(i),
 			IsCreator:         rand.Int31n(2),           // 0 hoặc 1
 			AdminRights:       rand.Int31n(5),           // 0..4
 			ParticipantType:   int8(rand.Intn(3) + 1),   // 1..3
@@ -110,49 +114,37 @@ func sampleData(channelID int32, size int, idStart int) ([]repo.ElasticUserChann
 // Tạo mẫu dữ liệu và load lên elastic & redis
 func LoadAllData() {
 	fmt.Println("----------------------- Migrating Data ----------------------------")
-	// Tạo data mẫu cho channel 1001
-	docs, listUsers := sampleData(channelID, 500000, 1)
-	// Lưu bulk vào Elasticsearch
-	parts := make(chan *repo.ElasticUserChannleParticipantsDO, 4000)
-	go func() {
-		defer close(parts)
-		for _, p := range docs {
-			data := p
-			parts <- &data
+	// Tạo group data mẫu cho channel
+	for i := 0; i < 3; i++ {
+		docs, listUsers := sampleData(channelID, 50000, 1)
+		err := elaC.SaveAllUsers(channelID + int32(i), -1, docs)
+		if err != nil {
+			fmt.Println("SaveAllUsers Err: ", err)
+			return
 		}
-	}()
 
-	elaC.SaveAllDataBP(channelID, parts)
-	// elaC.SetChannelVersion(1001, 1)
-	redisC.SaveAllData(channelID, listUsers)
-	redisC.SaveString(channelID, listUsers)
-
-	meta, err := elaC.SelectMetaData(channelID)
-	if err != nil {
-		fmt.Println("LoadAllData Err: ", err)
-	} else if meta == nil {
-		fmt.Println("SelectMetaData is nil")
-	} else {
-		fmt.Println("SelectMetaData: ", *meta)
+		redisC.SaveAllData(channelID  + int32(i), listUsers)
+		// redisC.SaveString(channelID, listUsers)
 	}
+	fmt.Println("Migrate data completed!")
 }
 
 // Thêm người dùng
-func AddUsser() {
-	fmt.Println("----------------------- Test Add User Scenario ----------------------------")
-	newUsers, _ := sampleData(channelID, 10, 500001)
-	newChannlParticipant := repo.ElasticChannleParticipantsDO{
-		Version:      10,
-		Participants: newUsers,
-	}
-	elaC.AddOrUpsertData(channelID, &newChannlParticipant)
+// func AddUsser() {
+// 	fmt.Println("----------------------- Test Add User Scenario ----------------------------")
+// 	newUsers, _ := sampleData(channelID, 10, 500001)
+// 	newChannlParticipant := repo.ElasticChannleParticipantsDO{
+// 		Version:      -1,
+// 		Participants: newUsers,
+// 	}
+// 	elaC.AddUpsertData(channelID, &newChannlParticipant)
 
-	meta, err := elaC.SelectMetaData(channelID)
-	if err != nil {
-		fmt.Println("LoadAllData Err: ", err)
-	}
-	fmt.Println("SelectMetaData: ", *meta)
-}
+// 	meta, err := elaC.SelectMetaData(channelID)
+// 	if err != nil {
+// 		fmt.Println("LoadAllData Err: ", err)
+// 	}
+// 	fmt.Println("SelectMetaData: ", *meta)
+// }
 
 // Triển khai kịch bản xóa người dùng:
 // - Xóa 1 người dùng
@@ -165,4 +157,20 @@ func DeleteUser() {}
 func UpdateUser() {}
 
 // Triển khai kịch bản
-func GetData() {}
+func GetData() {
+	fmt.Println("----------------------- Get Data ----------------------------")
+	timeStart := time.Now()
+
+	_, total, err := elaC.GetUserAdmins(channelID, 10000, 0)
+	if err != nil {
+		fmt.Println("err get list: ", err)
+	}
+	fmt.Println("Get all Admin Total: ", total)
+	// fmt.Println("Get all Admin: ", *getData)
+
+	_, ok := redisC.GetList(channelID)
+	if !ok {
+		fmt.Println("err get list!")
+	}
+	fmt.Println("Time to Get Data: ", time.Since(timeStart).Milliseconds(), "ms")
+}

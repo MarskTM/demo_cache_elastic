@@ -1,29 +1,12 @@
 package repo
 
-import "time"
-
 // ElasticChatParticipantsDO type;
-type ElasticChannleParticipantsDO struct {
+type ElasticChannleDO struct {
 	Version      int32 `json:"version"`
-	Participants []ElasticUserChannleParticipantsDO
+	Participants []ElasticChannelParticipantsDO
 }
 
 // ------------------------------- Elastic Model -----------------------------------------
-type ElasticUserChannleParticipantsDO struct {
-	ID                int64                  `json:"id"`
-	ChannelID         int32                  `json:"channel_id"`
-	UserID            int64                  `json:"user_id,omitempty"`
-	IsCreator         int32                  `json:"is_creator"`
-	AdminRights       int32                  `json:"admin_rights"`
-	ParticipantType   int8                   `json:"participant_type"`
-	HiddenParticipant int8                   `json:"hidden_participant"`
-	IsLeft            int8                   `json:"is_left"`
-	LeftAt            int32                  `json:"left_at"`
-	IsKicked          int8                   `json:"is_kicked"`
-	BannedRights      int32                  `json:"banned_rights"`
-	BannedUntilDate   int32                  `json:"banned_until_date"`
-	Data              *ChannelParticipantsDO `json:"data"`
-}
 
 type ChannelParticipantsDO struct {
 	ID                        int64  `db:"id"`
@@ -58,8 +41,25 @@ type ChannelParticipantsDO struct {
 	UpdatedAt                 string `db:"updated_at"`
 }
 
-type ElasticMetaChannelParticipantDO struct {
-	ChannelID int32     `json:"channel_id"`
-	Version   int32     `json:"version"`
-	UpdatedAt time.Time `json:"updated_at"`
+// ElasticChatParticipantsDO type;
+type ElasticChannelParticipantsDO struct {
+	ID                int64                  `json:"id"`
+	ChannelID         int32                  `json:"channel_id"`
+	UserID            int32                  `json:"user_id,omitempty"`
+	IsCreator         int32                  `json:"is_creator"`
+	AdminRights       int32                  `json:"admin_rights"`
+	ParticipantType   int8                   `json:"participant_type"`
+	HiddenParticipant int8                   `json:"hidden_participant"`
+	IsLeft            int8                   `json:"is_left"`
+	LeftAt            int32                  `json:"left_at"`
+	IsKicked          int8                   `json:"is_kicked"`
+	BannedRights      int32                  `json:"banned_rights"`
+	BannedUntilDate   int32                  `json:"banned_until_date"`
+	Data              *ChannelParticipantsDO `json:"data"`
+}
+
+type ElasticChannelParticipantMetaDO struct {
+	ChannelID int32 `json:"channel_id"`
+	Version   int32 `json:"version"`
+	UpdateAt  int64 `json:"update_at"`
 }

@@ -4,11 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/olivere/elastic/v7"
+)
+
+const (
+	ELASTIC_SIZE_INDEX = 1000 // số shard index
 )
 
 // ElasticMessagesDAO type
@@ -16,11 +22,16 @@ type ElasticChannelParticipantsDAO struct {
 	client *elastic.Client
 }
 
-func GetChannelIndex(channelID int32) string {
-	return fmt.Sprintf("channel_participant_%d", channelID)
+func GetElasticChannelIndex(channelID int32, sizeIndex int32) string {
+	if channelID <= 0 {
+		return ""
+	}
+
+	shard := channelID % sizeIndex
+	return fmt.Sprintf("channel_participants_%03d", shard)
 }
 
-func GetParicipantID(channelID int32, userID int64) string {
+func GetParicipantID(channelID int32, userID int32) string {
 	return fmt.Sprintf("channel:%d:%d", channelID, userID)
 }
 
@@ -34,103 +45,143 @@ func NewElasticChannelParticipantsDAO(client *elastic.Client) *ElasticChannelPar
 	return &ElasticChannelParticipantsDAO{client}
 }
 
-// Bump version cho channel:<id>:meta (version++), không đụng tới participant docs
-func (e *ElasticChannelParticipantsDAO) SetChannelVersion(channelID int32, version int64) (int64, error) {
+// SaveAllUsers reload lại toàn bộ data lên elastic.
+// Đặt version = -1 nếu không muốn cập nhật version.
+// Đặt version = 0 nếu không muốn cập nhật version.
+func (e *ElasticChannelParticipantsDAO) SaveAllUsers(channelID int32, version int32, list []ElasticChannelParticipantsDO) error {
+	fmt.Println("Start SaveAllUsers ...")
 	if e == nil || e.client == nil {
-		return 0, fmt.Errorf("DAO/client is nil")
+		return fmt.Errorf("DAO/client is nil")
 	}
-	if version <= 0 {
-		return 0, fmt.Errorf("version must be > 0")
-	}
-
-	index := GetChannelIndex(channelID)
-	if index == "" {
-		return 0, fmt.Errorf("index is empty")
-	}
-	metaID := fmt.Sprintf("channel:%d:meta", channelID)
-	now := time.Now().UTC()
-
-	// Script: set cứng version = params.v
-	scr := elastic.NewScript(`
-		ctx._source.version = params.v;
-		ctx._source.updated_at = params.ts;
-	`).Param("v", version).Param("ts", now)
-
-	// Nếu chưa có meta thì upsert với đúng version bạn truyền
-	upsert := map[string]any{
-		"channel_id": channelID,
-		"version":    version,
-		"updated_at": now,
-	}
-
-	resp, err := e.client.Update().
-		Index(index).Id(metaID).
-		Script(scr).Upsert(upsert).
-		FetchSource(true).
-		Do(context.Background())
-	if err != nil {
-		return 0, err
-	}
-
-	var src struct {
-		Version int64 `json:"version"`
-	}
-	if resp.GetResult != nil && resp.GetResult.Source != nil {
-		// LƯU Ý: cần deref *json.RawMessage
-		_ = json.Unmarshal(resp.GetResult.Source, &src)
-	}
-	if src.Version == 0 {
-		src.Version = version
-	}
-	return src.Version, nil
-}
-
-// SaveAllData: bulk Reset lại toàn bộ dữ liệu vào index theo channelID.
-func (e *ElasticChannelParticipantsDAO) SaveAllDataBP(
-	channelID int32,
-	parts <-chan *ElasticUserChannleParticipantsDO,
-) (string, error) {
-
-	if e == nil || e.client == nil {
-		return "", fmt.Errorf("DAO/client is nil")
-	}
-	indexName := GetChannelIndex(channelID)
+	indexName := GetElasticChannelIndex(channelID, ELASTIC_SIZE_INDEX)
 	if indexName == "" {
-		return "", fmt.Errorf("index is empty")
+		return fmt.Errorf("index is empty")
+	}
+	ctx := context.Background()
+	if err := e.ensureIndexExists(ctx, indexName); err != nil {
+		return err
 	}
 
+	route := strconv.Itoa(int(channelID))
+	metaID := GetChannelMeta(channelID)
+
+	// 1. Xóa data cũ của theo channelID
+	q := elastic.NewBoolQuery().
+		Must(elastic.NewPrefixQuery("channel_id", fmt.Sprintf("%d", channelID))).
+		MustNot(elastic.NewIdsQuery().Ids(metaID))
+
+	_, err := e.client.DeleteByQuery(indexName).
+		Query(q).
+		Conflicts("proceed"). // tiếp tục chạy nếu có xung đột version
+		Routing(route).       // request đến đúng shard, không cần broadcast toàn cluster.
+		// WaitForCompletion(false). // chạy bất đồng bộ, không đợi kết quả xong ngay lập tức.
+		RequestsPerSecond(5000). // -1 không throttle, tốc độ xử lý docs/giây.
+		Do(ctx)
+	if err != nil && !elastic.IsNotFound(err) {
+		return fmt.Errorf("delete participants failed: %w", err)
+	}
+
+	// 2. Tạo BulkProcessor
 	bp, err := e.client.BulkProcessor().
 		Name(fmt.Sprintf("bp-channel-%d", channelID)).
-		Workers(3).
-		BulkActions(4000).
-		BulkSize(15 << 20).
-		FlushInterval(2 * time.Second).
-		Backoff(elastic.NewExponentialBackoff(200*time.Millisecond, 5*time.Second)).
+		Workers(3).                     // số goroutine xử lý bulk song song
+		BulkActions(4000).              // tối đa 4000 req/batch
+		BulkSize(15 << 20).             // tối đa 15MB/batch
+		FlushInterval(1 * time.Second). // auto flush sau 1s nếu chưa đủ batch
+		Backoff(elastic.NewExponentialBackoff(
+			200*time.Millisecond, 1*time.Second, // retry từ 200ms đến 1s
+		)). // retry backoff
 		After(func(execID int64, reqs []elastic.BulkableRequest, resp *elastic.BulkResponse, err error) {
 			if err != nil {
-				log.Printf("bulk batch error: %v", err)
+				// glog.V(1).Infof("bulk batch error: %v", err)
+				fmt.Printf("bulk batch error: %v\n", err)
 				return
 			}
-			if resp != nil && resp.Errors {
-				for _, item := range resp.Items {
-					for _, r := range item {
-						if r.Error != nil {
-							log.Printf("bulk item failed: id=%s reason=%s", r.Id, r.Error.Reason)
-						}
-					}
-				}
-			}
+			// if resp != nil && resp.Errors {
+			// 	for _, item := range resp.Items {
+			// 		for _, r := range item {
+			// 			if r.Error != nil {
+			// 				glog.V(3).Infof("bulk item failed: id=%s reason=%s", r.Id, r.Error.Reason)
+			// 			}
+			// 		}
+			// 	}
+			// }
 		}).
 		Do(context.Background())
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer bp.Close()
 
-	for p := range parts {
-		if p == nil {
-			continue
-		}
+	for _, p := range list {
+		id := GetParicipantID(channelID, p.UserID)
+		req := elastic.NewBulkIndexRequest().
+			Index(indexName).
+			Id(id).
+			Routing(strconv.Itoa(int(channelID))). // định tuyến đúng shard
+			Doc(p)
+
+		bp.Add(req)
+	}
+
+	// 3. Flush và đợi hoàn tất
+	if err := bp.Flush(); err != nil {
+		return err
+	}
+
+	// // 4. Upsert META (channel:<cid>:meta) với version nếu có
+	// if err := e.SetVersion(channelID, version); err != nil {
+	// 	return fmt.Errorf("set version failed: %w", err)
+	// }
+
+	fmt.Println("Bulk index completed.")
+	return nil
+}
+
+// Hàm thực hiện để Add hoặc Update lại thông tin các participant được truyền vào.
+// Nếu muốn cập nhật kích thước, số lượng participants khi có người rời nhóm -> dùng SaveAllUser hoặc DeleteUser.
+// Đặt version = -1 nếu muốn tự động tăng version.
+// Đặt version = 0 nếu không muốn cập nhật lại version.
+func (e *ElasticChannelParticipantsDAO) AddDataToCache(channelID int32, version int32, list []ChannelParticipantsDO) error {
+	if e == nil || e.client == nil {
+		return fmt.Errorf("DAO/client is nil")
+	}
+	indexName := GetElasticChannelIndex(channelID, ELASTIC_SIZE_INDEX)
+	if indexName == "" {
+		return fmt.Errorf("index is empty")
+	}
+
+	// 1. Tạo BulkProcessor
+	bp, err := e.client.BulkProcessor().
+		Name(fmt.Sprintf("bp-channel-add-%d", channelID)).
+		Workers(3).                                                                  // số goroutine xử lý bulk song song
+		BulkActions(4000).                                                           // tối đa 4000 req/batch
+		BulkSize(15 << 20).                                                          // tối đa 15MB/batch
+		FlushInterval(1 * time.Second).                                              // auto flush sau 1s nếu chưa đủ batch
+		Backoff(elastic.NewExponentialBackoff(200*time.Millisecond, 1*time.Second)). // retry backoff
+		After(func(execID int64, reqs []elastic.BulkableRequest, resp *elastic.BulkResponse, err error) {
+			if err != nil {
+				// glog.V(3).Info("bulk batch error: %v", err)
+				fmt.Printf("bulk batch error: %v\n", err)
+				return
+			}
+			// if resp != nil && resp.Errors {
+			// 	for _, item := range resp.Items {
+			// 		for _, r := range item {
+			// 			if r.Error != nil {
+			// 				glog.V(3).Info("bulk item failed: id=%s reason=%s", r.Id, r.Error.Reason)
+			// 			}
+			// 		}
+			// 	}
+			// }
+		}).
+		Do(context.Background())
+	if err != nil {
+		return err
+	}
+	defer bp.Close()
+
+	for _, p := range list {
 		id := GetParicipantID(channelID, p.UserID)
 
 		req := elastic.NewBulkUpdateRequest().
@@ -143,333 +194,314 @@ func (e *ElasticChannelParticipantsDAO) SaveAllDataBP(
 		bp.Add(req)
 	}
 
-	// 2) Upsert META (channel:<cid>:meta) với version
-	metaID := GetChannelMeta(channelID)
-	metaDoc := ElasticMetaChannelParticipantDO{
-		ChannelID: channelID,
-		Version: int32(0),
-		UpdatedAt: time.Now().UTC(),
-	}
-	metaReq := elastic.NewBulkUpdateRequest().
-		Index(indexName).
-		Id(metaID).
-		Routing(strconv.Itoa(int(channelID))).
-		Doc(metaDoc).
-		DocAsUpsert(true).
-		RetryOnConflict(3)
-	bp.Add(metaReq)
-
 	if err := bp.Flush(); err != nil {
-		return "", err
+		return err
+	}
+
+	if err := e.SetVersion(channelID, version); err != nil {
+		return fmt.Errorf("set version after delete failed: %w", err)
 	}
 
 	// đảm bảo tài liệu hiển thị ngay cho search
 	if _, err := e.client.Refresh(indexName).Do(context.Background()); err != nil {
-		return "", fmt.Errorf("refresh failed: %w", err)
+		return fmt.Errorf("refresh failed: %w", err)
 	}
 
-	return "ok", nil
+	return nil
 }
 
-// SaveAllData: bulk upsert toàn bộ dữ liệu vào index theo channelID.
-// - Có tuỳ chọn refresh=wait_for (bật bằng biến cục bộ ngay dưới)
-func (e *ElasticChannelParticipantsDAO) AddOrUpsertData(channelID int32, data *ElasticChannleParticipantsDO) string {
-	if e == nil || e.client == nil {
-		return "error: DAO/client is nil"
-	}
-	indexName := GetChannelIndex(channelID)
-	if indexName == "" {
-		return "error: index is empty"
-	}
-	if data == nil {
-		return "error: data is nil"
-	}
-
-	const (
-		requestTimeout = 30 * time.Second
-		useRefreshWait = true // đặt false nếu không cần chờ index xong mới thấy khi search
-	)
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	defer cancel()
-
-	route := strconv.Itoa(int(channelID))
-	nowUTC := time.Now().UTC()
-
-	bulk := e.client.Bulk()
-
-	// 1) Nếu có version != 0 -> cập nhật meta/version của channel
-	//    Lưu 1 doc "meta" cho channel để theo dõi version (id gợi ý)
-	if data.Version != 0 {
-		metaID := fmt.Sprintf("channel:%d:meta", channelID)
-		metaDoc := ElasticMetaChannelParticipantDO{
-			ChannelID: channelID,
-			Version:   data.Version,
-			UpdatedAt: nowUTC,
-		}
-		metaReq := elastic.NewBulkUpdateRequest().
-			Index(indexName).
-			Id(metaID).
-			Routing(route).
-			Doc(metaDoc).
-			DocAsUpsert(true) // chưa có -> tạo mới meta
-		bulk.Add(metaReq)
-	}
-
-	// 2) Upsert toàn bộ participants
-	if len(data.Participants) > 0 {
-		for _, p := range data.Participants {
-			// Nếu struct p có ChannelID/UserID đầy đủ:
-			pid := GetParicipantID(p.ChannelID, p.UserID) // ví dụ: "channel:<cid>:<uid>"
-
-			req := elastic.NewBulkUpdateRequest().
-				Index(indexName).
-				Id(pid).
-				Routing(route).
-				Doc(p).            // partial doc
-				DocAsUpsert(true). // chưa có -> insert p
-				RetryOnConflict(3) // giảm xung đột phiên bản
-			bulk.Add(req)
-		}
-	}
-
-	if bulk.NumberOfActions() == 0 {
-		return "ok: no-ops"
-	}
-
-	// Tuỳ chọn: chờ index xong để search thấy ngay
-	if useRefreshWait {
-		bulk = bulk.Refresh("wait_for")
-	}
-
-	resp, err := bulk.Do(ctx)
-	if err != nil {
-		return fmt.Sprintf("bulk error: %v", err)
-	}
-	if resp == nil {
-		return "bulk error: nil response"
-	}
-
-	// Log lỗi từng item nếu có
-	if resp.Errors {
-		fail := 0
-		for _, it := range resp.Items {
-			for op, r := range it {
-				if r.Error != nil {
-					fail++
-					log.Printf("bulk %s failed: id=%s status=%d reason=%s", op, r.Id, r.Status, r.Error.Reason)
-				}
-			}
-		}
-		return fmt.Sprintf("ok with errors: items=%d failed=%d", len(resp.Items), fail)
-	}
-
-	return fmt.Sprintf("ok: items=%d", len(resp.Items))
-}
-
-func (e *ElasticChannelParticipantsDAO) SelectListAdmins(ctx context.Context, channelID int32, limit, offset int) (
-	*ElasticChannleParticipantsDO, int64, error,
-) {
+// ------------------------------------------------------------------------------------------------------------------------
+func (e *ElasticChannelParticipantsDAO) GetUserAdmins(channelID int32, limit, offset int32) ([]ChannelParticipantsDO, int32, error) {
 	if e == nil || e.client == nil {
 		return nil, 0, fmt.Errorf("DAO/client is nil")
-	}
-	if limit <= 0 {
-		limit = 10
 	}
 	if offset < 0 {
 		offset = 0
 	}
 
-	indexName := GetChannelIndex(channelID)
+	indexName := GetElasticChannelIndex(channelID, ELASTIC_SIZE_INDEX)
+	if indexName == "" {
+		return nil, 0, fmt.Errorf("index is empty")
+	}
 
-	// WHERE channel_id = ? AND is_left = 0 AND is_kicked = 0
-	//   AND (is_creator = 1 OR admin_rights > 0)
+	ctx := context.Background()
+	route := strconv.FormatInt(int64(channelID), 10)
+
+	// WHERE channel_id = ? AND is_left = 0 AND is_kicked = 0 AND hidden_participant = 0
 	boolQ := elastic.NewBoolQuery().
 		Filter(
-			elastic.NewTermsQuery("channel_id", 1001),
+			elastic.NewTermQuery("channel_id", channelID),
 			elastic.NewTermQuery("is_left", 0),
 			elastic.NewTermQuery("is_kicked", 0),
+			elastic.NewTermQuery("hidden_participant", 0),
 		).
 		Should(
-			elastic.NewTermQuery("is_creator", 1),
-			elastic.NewRangeQuery("admin_rights").Gt(0),
+			elastic.NewTermQuery("is_creator", 1),       // is_creator = 1
+			elastic.NewRangeQuery("admin_rights").Gt(0), // admin_rights > 0
 		).
 		MinimumShouldMatch("1")
 
-	search := e.client.Search().
-		Index(indexName).
-		Query(boolQ).
-		From(offset).
-		Size(limit).
-		TrackTotalHits(true).
-		Sort("user_id", true). // hoặc "promoted_at"/"joined_at" nếu có
-		Routing(strconv.FormatInt(int64(channelID), 10))
+	// --------- Lấy hết (limit == -1): dùng Scroll ----------
+	if limit == -1 {
+		const batch = 2000
+		scroll := e.client.Scroll(indexName).
+			Query(boolQ).
+			Size(batch).
+			Sort("user_id", false).
+			Routing(route).
+			Scroll("1m")
+		defer scroll.Clear(ctx)
 
-	res, err := search.Do(ctx)
-	if err != nil {
-		return nil, 0, err
+		items := make([]ChannelParticipantsDO, 0, batch)
+		skipped := int(offset)
+		var total int64
+
+		for {
+			res, err := scroll.Do(ctx)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, 0, fmt.Errorf("scroll failed: %w", err)
+			}
+			if res == nil || res.Hits == nil || len(res.Hits.Hits) == 0 {
+				break
+			}
+
+			total += int64(len(res.Hits.Hits))
+			for _, h := range res.Hits.Hits {
+				if skipped > 0 {
+					skipped--
+					continue
+				}
+				var doc ChannelParticipantsDO
+				if err := json.Unmarshal(h.Source, &doc); err != nil {
+					fmt.Println("Unmarshal data err:", err)
+					continue
+				}
+				items = append(items, doc)
+			}
+		}
+		return items, int32(total), nil
 	}
 
-	total := int64(0)
+	// --------- Phân trang bình thường (from/size) ----------
+	res, err := e.client.Search().
+		Index(indexName).
+		Query(boolQ).
+		From(int(offset)).
+		Size(int(limit)).
+		TrackTotalHits(true).
+		Sort("user_id", false). // desc
+		Routing(route).
+		Do(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("search failed: %w", err)
+	}
+
+	var total int64
 	if res.Hits != nil && res.Hits.TotalHits != nil {
 		total = res.Hits.TotalHits.Value
 	}
 
-	items := make([]ElasticUserChannleParticipantsDO, 0, len(res.Hits.Hits))
+	items := make([]ChannelParticipantsDO, 0, len(res.Hits.Hits))
 	for _, h := range res.Hits.Hits {
-		var doc ElasticUserChannleParticipantsDO
+		var doc ChannelParticipantsDO
 		if err := json.Unmarshal(h.Source, &doc); err != nil {
-			// nếu cần, log và skip 1 bản ghi lỗi
-			fmt.Println("Unmarshal data err: ", err)
-
+			fmt.Println("Unmarshal data err:", err)
 			continue
 		}
 		items = append(items, doc)
 	}
 
-	ChannlAdmin := ElasticChannleParticipantsDO{
-		Version:      1,
-		Participants: items,
-	}
-
-	return &ChannlAdmin, total, nil
+	return items, int32(total), nil
 }
 
-func (e *ElasticChannelParticipantsDAO) DeleteParticipant(channelID int32, userIDs []int32) bool {
-	if e == nil || e.client == nil {
-		log.Printf("elastic client is nil")
-		return false
-	}
-	indexName := GetChannelIndex(channelID)
-	if indexName == "" {
-		log.Printf("index is empty")
-		return false
-	}
-	if len(userIDs) == 0 {
-		return true // không có gì để xoá
-	}
-
-	ctx := context.Background()
-	const chunkSize = 2000
-	routing := strconv.Itoa(int(channelID))
-
-	for start := 0; start < len(userIDs); start += chunkSize {
-		end := start + chunkSize
-		if end > len(userIDs) {
-			end = len(userIDs)
-		}
-
-		bulk := e.client.Bulk()
-		for _, uid := range userIDs[start:end] {
-			id := fmt.Sprintf("channel:%d:%d", channelID, uid)
-			req := elastic.NewBulkDeleteRequest().
-				Index(indexName).
-				Id(id).
-				Routing(routing)
-			bulk.Add(req)
-		}
-
-		if bulk.NumberOfActions() == 0 {
-			continue
-		}
-
-		resp, err := bulk.Do(ctx)
-		if err != nil {
-			log.Printf("bulk delete error: %v", err)
-			return false
-		}
-		if resp == nil {
-			log.Printf("bulk delete nil response")
-			return false
-		}
-
-		// Log chi tiết lỗi từng item (nếu có)
-		if resp.Errors {
-			for _, item := range resp.Items {
-				if d, ok := item["delete"]; ok {
-					// 404 coi như đã xoá trước đó -> không fail
-					if d.Error != nil && d.Status != 404 {
-						log.Printf("delete failed: id=%s status=%d reason=%s", d.Id, d.Status, d.Error.Reason)
-					}
-				}
-			}
-		}
-	}
-
-	// Đảm bảo thấy ngay trên search
-	if _, err := e.client.Refresh(indexName).Do(ctx); err != nil {
-		log.Printf("refresh failed: %v", err)
-		// không coi là fail nghiêm trọng
-	}
-
-	return true
-}
-
-func (e *ElasticChannelParticipantsDAO) SelectMetaData(channelID int32) (*ElasticMetaChannelParticipantDO, error) {
+// ------------------------------------------------------------------------------------------------------------------------
+// Lấy version hiện tại của channel
+func (e *ElasticChannelParticipantsDAO) GetVersion(channelID int32) (*ElasticChannelParticipantMetaDO, error) {
 	if e == nil || e.client == nil {
 		return nil, fmt.Errorf("DAO/client is nil")
 	}
-	indexName := GetChannelIndex(channelID)
+
+	indexName := GetElasticChannelIndex(channelID, ELASTIC_SIZE_INDEX)
 	if indexName == "" {
 		return nil, fmt.Errorf("index is empty")
 	}
 
-	idMeta := GetChannelMeta(channelID)   // ví dụ: "channel:<cid>:_meta"
-	route := strconv.Itoa(int(channelID)) // base 10
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	ctx := context.Background()
+	route := strconv.Itoa(int(channelID)) // request đến đúng shard, tránh broadcast toàn cluster.
+	metaID := GetChannelMeta(channelID)   // ví dụ: "channel:123:meta"
 
+	// Parse source
+	meta := ElasticChannelParticipantMetaDO{}
+
+	// Lấy document meta
 	resp, err := e.client.Get().
 		Index(indexName).
-		Id(idMeta).
+		Id(metaID).
 		Routing(route).
 		Do(ctx)
-	if elastic.IsNotFound(err) {
-		fmt.Println("MetaData not found!")
-		return nil, nil
-	}
 	if err != nil {
-		return nil, err
+		if elastic.IsNotFound(err) {
+			// chưa có version → mặc định 0
+			return &meta, nil
+		}
+		return nil, fmt.Errorf("get meta failed: %w", err)
 	}
-	if resp == nil || !resp.Found {
-		return nil, nil
+	if !resp.Found {
+		return &meta, nil
 	}
 
-	var meta ElasticMetaChannelParticipantDO
 	if err := json.Unmarshal(resp.Source, &meta); err != nil {
-		// fallback: phòng trường hợp updated_at không parse được về time.Time
-		var raw map[string]interface{}
-		if err2 := json.Unmarshal(resp.Source, &raw); err2 != nil {
-			return nil, fmt.Errorf("unmarshal meta failed: %v / %v", err, err2)
-		}
-		m := ElasticMetaChannelParticipantDO{}
-		if v, ok := raw["channel_id"].(float64); ok {
-			m.ChannelID = int32(v)
-		}
-		if v, ok := raw["version"].(float64); ok {
-			m.Version = int32(v)
-		}
-		if v, ok := raw["updated_at"].(string); ok {
-			if t, perr := time.Parse(time.RFC3339, v); perr == nil {
-				m.UpdatedAt = t
-			}
-		}
-		meta = m
+		return nil, fmt.Errorf("unmarshal meta failed: %w", err)
 	}
 
 	return &meta, nil
 }
 
+// Đặt version = -1 để tự động tăng.
+// Đặt version = 0 để bỏ qua update version.
+func (e *ElasticChannelParticipantsDAO) SetVersion(channelID int32, version int32) error {
+	if e == nil || e.client == nil {
+		return fmt.Errorf("DAO/client is nil")
+	}
+	if version == 0 {
+		return nil
+	}
+
+	indexName := GetElasticChannelIndex(channelID, ELASTIC_SIZE_INDEX)
+	if indexName == "" {
+		return fmt.Errorf("index is empty")
+	}
+
+	ctx := context.Background()
+	route := strconv.Itoa(int(channelID))
+	metaID := GetChannelMeta(channelID)
+
+	now := time.Now().UTC()
+
+	if version == -1 {
+		// Atomic increment: nếu chưa có doc → upsert version=1
+		script := elastic.NewScript(`
+			if (ctx._source.version == null) {
+				ctx._source.version = params.start;
+			} else {
+				ctx._source.version += params.inc;
+			}
+			ctx._source.updated = params.now;
+		`).
+			Param("start", 1).
+			Param("inc", 1).
+			Param("now", now)
+
+		_, err := e.client.Update().
+			Index(indexName).
+			Id(metaID).
+			Routing(route).
+			Script(script).
+			// scripted upsert bảo đảm chạy script cả khi doc chưa tồn tại
+			ScriptedUpsert(true).
+			// Upsert body chỉ cần tối thiểu để init; script sẽ set lại updated
+			Upsert(ElasticChannelParticipantMetaDO{
+				ChannelID: channelID,
+				Version:   1,
+				UpdateAt:  now.Unix(),
+			}).
+			Refresh("wait_for").
+			RetryOnConflict(3).
+			Do(ctx)
+		if err != nil {
+			return fmt.Errorf("update (increment) failed: %w", err)
+		}
+		return nil
+	}
+
+	meta := ElasticChannelParticipantMetaDO{
+		ChannelID: channelID,
+		Version:   version,
+		UpdateAt:  now.Unix(),
+	}
+
+	_, err := e.client.Update().
+		Index(indexName).
+		Id(metaID).
+		Routing(route).
+		Doc(meta).         // partial update các field trong struct
+		DocAsUpsert(true). // nếu chưa có thì upsert
+		Refresh("wait_for").
+		RetryOnConflict(3).
+		Do(ctx)
+	if err != nil {
+		return fmt.Errorf("update meta failed: %w", err)
+	}
+
+	return nil
+}
+
+// Đặt version = -1 để tự động tăng.
+// Đặt version = 0 để bỏ qua.
+func (e *ElasticChannelParticipantsDAO) DeleteUsers(channelID int32, version int32, listUserID []int32) error {
+	if e == nil || e.client == nil {
+		return fmt.Errorf("DAO/client is nil")
+	}
+	indexName := GetElasticChannelIndex(channelID, ELASTIC_SIZE_INDEX)
+	if indexName == "" {
+		return fmt.Errorf("index is empty")
+	}
+	if len(listUserID) == 0 {
+		return fmt.Errorf("listUserID empty")
+	}
+
+	ctx := context.Background()
+	route := strconv.Itoa(int(channelID))
+
+	const chunkSize = 1000
+	for i := 0; i < len(listUserID); i += chunkSize {
+		end := i + chunkSize
+		if end > len(listUserID) {
+			end = len(listUserID)
+		}
+		part := listUserID[i:end]
+
+		terms := make([]interface{}, len(part))
+		for j, uid := range part {
+			terms[j] = uid
+		}
+
+		q := elastic.NewBoolQuery().Filter(elastic.NewTermsQuery("user_id", terms...))
+		resp, err := e.client.DeleteByQuery(indexName).
+			Query(q).
+			Routing(route).
+			Conflicts("proceed").
+			Refresh("wait_for").
+			Do(ctx)
+		if err != nil {
+			return fmt.Errorf("delete by query failed: %w", err)
+		}
+		if resp == nil || len(resp.Failures) > 0 {
+			return fmt.Errorf("delete by query has %d failures", len(resp.Failures))
+		}
+	}
+
+	// cập nhật meta version (hỗ trợ version = -1 để auto-increment)
+	if err := e.SetVersion(channelID, version); err != nil {
+		return fmt.Errorf("set version after delete failed: %w", err)
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------------------------
 func ConnectElastic() *elastic.Client {
 	// Thay đổi URL và thông tin đăng nhập cho phù hợp
-	esURL := "http://localhost:9200"
-	username := "elastic"     // nếu bạn tắt security, để ""
-	password := "changeme123" // nếu bạn tắt security, để ""
+	esURL := "http://10.8.14.55:9200"
+	// username := "elastic"     // nếu bạn tắt security, để ""
+	// password := "changeme123" // nếu bạn tắt security, để ""
 
 	client, err := elastic.NewClient(
 		elastic.SetURL(esURL),
 		elastic.SetSniff(false), // disable sniff khi chạy local / docker
-		elastic.SetBasicAuth(username, password),
+		// elastic.SetBasicAuth(username, password),
 	)
 	if err != nil {
 		log.Fatalf("Error creating the client: %s", err)
@@ -483,4 +515,50 @@ func ConnectElastic() *elastic.Client {
 	fmt.Printf("✅ Kết nối Elasticsearch thành công - code %d and version %s\n", code, info.Version.Number)
 
 	return client
+}
+
+func (e *ElasticChannelParticipantsDAO) ensureIndexExists(ctx context.Context, indexName string) error {
+	exists, err := e.client.IndexExists(indexName).Do(ctx)
+	if err != nil {
+		return fmt.Errorf("check index exists failed: %w", err)
+	}
+	if exists {
+		return nil
+	}
+
+	// Mapping gợi ý – chỉnh theo schema của bạn
+	body := map[string]any{
+		// "settings": map[string]any{
+		// 	"number_of_shards":   1,
+		// 	"number_of_replicas": 0,
+		// 	// Có thể tạm tắt refresh khi bulk lớn, rồi set lại sau:
+		// 	// "refresh_interval": "-1",
+		// },
+		// "mappings": map[string]any{
+		// 	"properties": map[string]any{
+		// 		"channel_id":   map[string]any{"type": "integer"},
+		// 		"user_id":      map[string]any{"type": "integer"},
+		// 		"version":      map[string]any{"type": "integer"},
+		// 		"update_at":    map[string]any{"type": "date", "format": "epoch_second"},
+		// 		"is_left":      map[string]any{"type": "integer"},
+		// 		"is_kicked":    map[string]any{"type": "integer"},
+		// 		"is_creator":   map[string]any{"type": "integer"},
+		// 		"admin_rights": map[string]any{"type": "integer"},
+		// 		"is_meta":      map[string]any{"type": "boolean"},
+		// 	},
+		// },
+	}
+
+	resp, err := e.client.CreateIndex(indexName).BodyJson(body).Do(ctx)
+	if err != nil {
+		// Bỏ qua nếu 2 tiến trình cùng lúc tạo => "resource_already_exists_exception"
+		if strings.Contains(err.Error(), "resource_already_exists_exception") {
+			return nil
+		}
+		return fmt.Errorf("create index %s failed: %w", indexName, err)
+	}
+	if !resp.Acknowledged {
+		return fmt.Errorf("create index %s not acknowledged", indexName)
+	}
+	return nil
 }
