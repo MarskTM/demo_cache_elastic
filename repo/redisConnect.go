@@ -20,6 +20,7 @@ func NewChannelParticipantsCacheDAO() *ChannelParticipantsCacheDAO {
 }
 
 func (r *ChannelParticipantsCacheDAO) SaveAllData(channelID int32, listUsers []int32) bool {
+	timeStart := time.Now()
 	key := fmt.Sprintf("channel:%d:participants", channelID)
 
 	// chuyển []int32 → []interface{}
@@ -35,6 +36,9 @@ func (r *ChannelParticipantsCacheDAO) SaveAllData(channelID int32, listUsers []i
 	} else {
 		log.Printf("✅ Redis Inserted %d users into %s", len(listUsers), key)
 	}
+
+	duration := time.Since(timeStart)
+	fmt.Printf("Thời gian thực thi của hàm SaveAllData: %s\n", duration)
 	return true
 }
 
@@ -136,6 +140,7 @@ func (r *ChannelParticipantsCacheDAO) UpsertUsers(channelID int32, userIDs []int
 
 // key: channel:<id>:participants:str
 func (r *ChannelParticipantsCacheDAO) SaveString(channelID int32, userIDs []int32) error {
+	timeStart := time.Now()
 	if r == nil || r.conn == nil {
 		return fmt.Errorf("redis client is nil")
 	}
@@ -156,6 +161,8 @@ func (r *ChannelParticipantsCacheDAO) SaveString(channelID int32, userIDs []int3
 	if err := r.conn.Set(key, b.String(), 0).Err(); err != nil {
 		return fmt.Errorf("redis SET error: %w", err)
 	}
+	duration := time.Since(timeStart)
+	fmt.Printf("Thời gian thực thi của hàm SaveString: %s\n", duration)
 	return nil
 }
 
@@ -192,8 +199,12 @@ func (r *ChannelParticipantsCacheDAO) GetString(channelID int32) ([]int32, error
 		out = append(out, int32(v))
 	}
 	duration := time.Since(timeStart)
-	fmt.Printf("Thời gian thực thi của hàm GetList: %s\n", duration)
+	fmt.Printf("Thời gian thực thi của hàm GetString: %s\n", duration)
 	return out, nil
+}
+
+func (r *ChannelParticipantsCacheDAO) UpsertString(channelID int32, userIDs []int32) ([]int32, error) {
+	return nil, nil
 }
 
 // ConnectRedis khởi tạo kết nối Redis (go-redis cũ, không dùng context trong Ping()).

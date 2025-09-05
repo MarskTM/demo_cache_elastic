@@ -49,7 +49,7 @@ func NewElasticChannelParticipantsDAO(client *elastic.Client) *ElasticChannelPar
 // Đặt version = -1 nếu không muốn cập nhật version.
 // Đặt version = 0 nếu không muốn cập nhật version.
 func (e *ElasticChannelParticipantsDAO) SaveAllUsers(channelID int32, version int32, list []ElasticChannelParticipantsDO) error {
-	fmt.Println("Start SaveAllUsers ...")
+
 	if e == nil || e.client == nil {
 		return fmt.Errorf("DAO/client is nil")
 	}
@@ -61,13 +61,14 @@ func (e *ElasticChannelParticipantsDAO) SaveAllUsers(channelID int32, version in
 	if err := e.ensureIndexExists(ctx, indexName); err != nil {
 		return err
 	}
+	// fmt.Println("Start SaveAllUsers ...")
 
 	route := strconv.Itoa(int(channelID))
 	metaID := GetChannelMeta(channelID)
 
 	// 1. Xóa data cũ của theo channelID
 	q := elastic.NewBoolQuery().
-		Must(elastic.NewPrefixQuery("channel_id", fmt.Sprintf("%d", channelID))).
+		Filter(elastic.NewTermQuery("channel_id", channelID)).
 		MustNot(elastic.NewIdsQuery().Ids(metaID))
 
 	_, err := e.client.DeleteByQuery(indexName).
@@ -129,10 +130,10 @@ func (e *ElasticChannelParticipantsDAO) SaveAllUsers(channelID int32, version in
 		return err
 	}
 
-	// // 4. Upsert META (channel:<cid>:meta) với version nếu có
-	// if err := e.SetVersion(channelID, version); err != nil {
-	// 	return fmt.Errorf("set version failed: %w", err)
-	// }
+	// 4. Upsert META (channel:<cid>:meta) với version nếu có
+	if err := e.SetVersion(channelID, version); err != nil {
+		return fmt.Errorf("set version failed: %w", err)
+	}
 
 	fmt.Println("Bulk index completed.")
 	return nil
@@ -142,7 +143,7 @@ func (e *ElasticChannelParticipantsDAO) SaveAllUsers(channelID int32, version in
 // Nếu muốn cập nhật kích thước, số lượng participants khi có người rời nhóm -> dùng SaveAllUser hoặc DeleteUser.
 // Đặt version = -1 nếu muốn tự động tăng version.
 // Đặt version = 0 nếu không muốn cập nhật lại version.
-func (e *ElasticChannelParticipantsDAO) AddDataToCache(channelID int32, version int32, list []ChannelParticipantsDO) error {
+func (e *ElasticChannelParticipantsDAO) AddDataToCache(channelID int32, version int32, list []ElasticChannelParticipantsDO) error {
 	if e == nil || e.client == nil {
 		return fmt.Errorf("DAO/client is nil")
 	}
@@ -212,6 +213,7 @@ func (e *ElasticChannelParticipantsDAO) AddDataToCache(channelID int32, version 
 
 // ------------------------------------------------------------------------------------------------------------------------
 func (e *ElasticChannelParticipantsDAO) GetUserAdmins(channelID int32, limit, offset int32) ([]ChannelParticipantsDO, int32, error) {
+	timeStart := time.Now()
 	if e == nil || e.client == nil {
 		return nil, 0, fmt.Errorf("DAO/client is nil")
 	}
@@ -313,7 +315,8 @@ func (e *ElasticChannelParticipantsDAO) GetUserAdmins(channelID int32, limit, of
 		}
 		items = append(items, doc)
 	}
-
+	duration := time.Since(timeStart)
+	fmt.Printf("Thời gian thực thi của hàm GetUserAdmins: %s - total: %d \n", duration, total)
 	return items, int32(total), nil
 }
 
@@ -494,14 +497,15 @@ func (e *ElasticChannelParticipantsDAO) DeleteUsers(channelID int32, version int
 // ---------------------------------------------------------------------------------------------
 func ConnectElastic() *elastic.Client {
 	// Thay đổi URL và thông tin đăng nhập cho phù hợp
-	esURL := "http://10.8.14.55:9200"
-	// username := "elastic"     // nếu bạn tắt security, để ""
-	// password := "changeme123" // nếu bạn tắt security, để ""
+	// esURL := "http://10.8.14.55:9200"
+	esURL := "http://localhost:9200"
+	username := "elastic"     // nếu bạn tắt security, để ""
+	password := "changeme123" // nếu bạn tắt security, để ""
 
 	client, err := elastic.NewClient(
 		elastic.SetURL(esURL),
 		elastic.SetSniff(false), // disable sniff khi chạy local / docker
-		// elastic.SetBasicAuth(username, password),
+		elastic.SetBasicAuth(username, password),
 	)
 	if err != nil {
 		log.Fatalf("Error creating the client: %s", err)

@@ -23,11 +23,17 @@ services:
     container_name: kibana
     depends_on: [elasticsearch]
     environment:
-      - ELASTICSEARCH_HOSTS=http://es01:9200
       # DÙNG TOKEN, KHÔNG DÙNG USER/PASS
-      - ELASTICSEARCH_SERVICEACCOUNTTOKEN=AAEAAWVsYXN0aWMva2liYW5hL2tpYmFuYS10b2tlbjpfd25KZUlZYlRvS1ZTUllYRjRTTFVn
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_SERVICEACCOUNTTOKEN=AAEAAWVsYXN0aWMva2liYW5hL2tpYmFuYTphWFF4LV9PdVNBU0lyM3hsUzRFTmFB
     ports:
       - "5601:5601"
+
+  redis:
+    image: "redis:alpine"
+    container_name: redis
+    ports:
+      - "6379:6379"
 
 volumes:
   esdata:

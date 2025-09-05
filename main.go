@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 	"time"
 	"tool_cache/repo"
 )
@@ -26,28 +27,13 @@ func init() {
 
 func main() {
 	// migrate dữ liệu
-	LoadAllData()
+	// LoadAllData()
 
 	// Lấy dữ liệu
 	GetData()
 
-	// fmt.Println("----------------------- Get Filter Data ----------------------------")
-	// _, total, err := elaC.SelectListAdmins(context.Background(), 1001, 10000, 0)
-	// if err != nil {
-	// 	fmt.Println("err get list: ", err)
-	// }
-	// fmt.Println("Get all Admin Total: ", total)
-	// // fmt.Println("Get all Admin: ", *getData)
-
-	// _, ok := redisC.GetList(channelID)
-	// if !ok {
-	// 	fmt.Println("err get list!")
-	// }
-
-	// redisC.GetString(channelID)
-	// // fmt.Println("Get all listID: ", listID)
-
-	// AddUsser()
+	// Cập nhật dữ liệu
+	UpdateUser()
 }
 
 // ===================================================================================
@@ -114,19 +100,35 @@ func sampleData(channelID int32, size int, idStart int) ([]repo.ElasticChannelPa
 // Tạo mẫu dữ liệu và load lên elastic & redis
 func LoadAllData() {
 	fmt.Println("----------------------- Migrating Data ----------------------------")
+	timeStart := time.Now()
+	wg := sync.WaitGroup{}
+
+	/*
+		// Tạo group data mẫu cho channel
+		500K user/goroutine - process: 3 	time: 33962 ms
+		100K user/goroutine - process: 10 	time: 18696 ms
+		60K  user/goroutine - process: 20 	time  27325 ms
+	*/
+
 	// Tạo group data mẫu cho channel
 	for i := 0; i < 3; i++ {
-		docs, listUsers := sampleData(channelID, 50000, 1)
-		err := elaC.SaveAllUsers(channelID + int32(i), -1, docs)
-		if err != nil {
-			fmt.Println("SaveAllUsers Err: ", err)
-			return
-		}
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
 
-		redisC.SaveAllData(channelID  + int32(i), listUsers)
-		// redisC.SaveString(channelID, listUsers)
+			docs, listUsers := sampleData(channelID, 500000, 1)
+			err := elaC.SaveAllUsers(channelID+int32(i), -1, docs)
+			if err != nil {
+				fmt.Println("SaveAllUsers Err: ", err)
+				return
+			}
+
+			redisC.SaveAllData(channelID+int32(i), listUsers)
+			redisC.SaveString(channelID+int32(i), listUsers)
+		}(i)
 	}
-	fmt.Println("Migrate data completed!")
+	wg.Wait()
+	fmt.Println("Migrate data completed! Time to Migrate Data: ", time.Since(timeStart).Milliseconds(), "ms")
 }
 
 // Thêm người dùng
@@ -154,23 +156,65 @@ func DeleteUser() {}
 // Triển khai kịch bản cập nhật:
 // - Cập nhật thông tin của user mà không update version
 // - Cập nhật thông tin của users cùng version
-func UpdateUser() {}
+func UpdateUser() {
+	fmt.Println("----------------------- Update Data ----------------------------")
+
+	/*
+		// Cập nhật 1 user - process: 1	time:  153 ms
+		// Cập nhật 10 user - process: 1	time:  218 ms
+		// Cập nhật 100 user - process: 1	time:  293 ms
+		// Cập nhật 500 user - process: 1	time:  410 ms
+		// Cập nhật 1000 user - process: 1	time:  573 ms
+	*/
+
+	newData, newDataID := sampleData(channelID, 1000, 500001)
+	updateData, _ := sampleData(channelID, 1000, 1)
+
+	// update với version tự động tăng
+	println("Added new 1000 users")
+	err := elaC.AddDataToCache(channelID, -1, newData)
+	if err != nil {
+		fmt.Println("AddDataToCache Err: ", err)
+	}
+	if ok := redisC.SaveAllData(channelID, newDataID); !ok {
+		fmt.Println("SaveAllData Err!")
+	}
+	if err := redisC.SaveString(channelID, newDataID); err != nil {
+		fmt.Println("SaveString Err!")
+	}
+	
+	// update với version giữ nguyên
+	println("Updated 1000 existing users")
+	err = elaC.AddDataToCache(channelID+1, 10, updateData)
+	if err != nil {
+		fmt.Println("AddDataToCache Err: ", err)
+		return
+	}
+
+	if ok := redisC.SaveAllData(channelID+1, newDataID); !ok {
+		fmt.Println("SaveAllData Err!")
+	}
+
+
+}
 
 // Triển khai kịch bản
 func GetData() {
 	fmt.Println("----------------------- Get Data ----------------------------")
-	timeStart := time.Now()
+	// timeStart := time.Now()
 
-	_, total, err := elaC.GetUserAdmins(channelID, 10000, 0)
+	_, _, err := elaC.GetUserAdmins(channelID, 10000, 0)
 	if err != nil {
 		fmt.Println("err get list: ", err)
 	}
-	fmt.Println("Get all Admin Total: ", total)
-	// fmt.Println("Get all Admin: ", *getData)
 
 	_, ok := redisC.GetList(channelID)
 	if !ok {
 		fmt.Println("err get list!")
 	}
-	fmt.Println("Time to Get Data: ", time.Since(timeStart).Milliseconds(), "ms")
+
+	if _, err := redisC.GetString(channelID); err != nil {
+		fmt.Println("err get list!")
+	}
+	// fmt.Println("Time to Get Data: ", time.Since(timeStart).Milliseconds(), "ms")
 }
