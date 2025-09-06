@@ -27,7 +27,7 @@ func init() {
 
 func main() {
 	// migrate dữ liệu
-	// LoadAllData()
+	LoadAllData()
 
 	// Lấy dữ liệu
 	// GetData()
@@ -36,7 +36,7 @@ func main() {
 	// UpdateUser()
 
 	// Xoá dữ liệu
-	DeleteUser()
+	// DeleteUser()
 }
 
 // ===================================================================================
@@ -108,18 +108,20 @@ func LoadAllData() {
 
 	/*
 		// Tạo group data mẫu cho channel
-		500K user/goroutine - process: 3 	time: 33962 ms
-		100K user/goroutine - process: 10 	time: 18696 ms
-		60K  user/goroutine - process: 20 	time  27325 ms
+		500K user/goroutine - process: 3 	time: 33.962s
+		100K user/goroutine - process: 10 	time: 18.696s
+		60K  user/goroutine - process: 20 	time  27.325s
+		40K  user/goroutine - process: 20 	time  20.306s
+		20K  user/goroutine - process: 30 	time: 17.945s
 	*/
 
 	// Tạo group data mẫu cho channel
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 30; i++ {
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
 
-			docs, listUsers := sampleData(channelID, 500000, 1)
+			docs, listUsers := sampleData(channelID, 20000, 1)
 			err := elaC.SaveAllUsers(channelID+int32(i), -1, docs)
 			if err != nil {
 				fmt.Println("SaveAllUsers Err: ", err)
