@@ -49,7 +49,7 @@ func NewElasticChannelParticipantsDAO(client *elastic.Client) *ElasticChannelPar
 // Đặt version = -1 nếu không muốn cập nhật version.
 // Đặt version = 0 nếu không muốn cập nhật version.
 func (e *ElasticChannelParticipantsDAO) SaveAllUsers(channelID int32, version int32, list []ElasticChannelParticipantsDO) error {
-
+	timeStart := time.Now()
 	if e == nil || e.client == nil {
 		return fmt.Errorf("DAO/client is nil")
 	}
@@ -135,7 +135,9 @@ func (e *ElasticChannelParticipantsDAO) SaveAllUsers(channelID int32, version in
 		return fmt.Errorf("set version failed: %w", err)
 	}
 
-	fmt.Println("Bulk index completed.")
+	// fmt.Println("Bulk index completed.")
+	duration := time.Since(timeStart)
+	fmt.Printf("SaveAllUsers completed. Time: %s - total: %d\n", duration, len(list))
 	return nil
 }
 
@@ -144,6 +146,7 @@ func (e *ElasticChannelParticipantsDAO) SaveAllUsers(channelID int32, version in
 // Đặt version = -1 nếu muốn tự động tăng version.
 // Đặt version = 0 nếu không muốn cập nhật lại version.
 func (e *ElasticChannelParticipantsDAO) AddDataToCache(channelID int32, version int32, list []ElasticChannelParticipantsDO) error {
+	timeStart := time.Now()
 	if e == nil || e.client == nil {
 		return fmt.Errorf("DAO/client is nil")
 	}
@@ -207,7 +210,8 @@ func (e *ElasticChannelParticipantsDAO) AddDataToCache(channelID int32, version 
 	if _, err := e.client.Refresh(indexName).Do(context.Background()); err != nil {
 		return fmt.Errorf("refresh failed: %w", err)
 	}
-
+	duration := time.Since(timeStart)
+	fmt.Printf("AddDataToCache completed. Time: %s - total: %d\n", duration, len(list))
 	return nil
 }
 
@@ -244,7 +248,7 @@ func (e *ElasticChannelParticipantsDAO) GetUserAdmins(channelID int32, limit, of
 		MinimumShouldMatch("1")
 
 	// --------- Lấy hết (limit == -1): dùng Scroll ----------
-	if limit == -1 {
+	if limit == -1 || int(offset)+int(limit) > 10000 {
 		const batch = 2000
 		scroll := e.client.Scroll(indexName).
 			Query(boolQ).
@@ -254,11 +258,12 @@ func (e *ElasticChannelParticipantsDAO) GetUserAdmins(channelID int32, limit, of
 			Scroll("1m")
 		defer scroll.Clear(ctx)
 
-		items := make([]ChannelParticipantsDO, 0, batch)
+		items := make([]ChannelParticipantsDO, 0, min(int(limit), batch))
+		want := int(limit)
 		skipped := int(offset)
 		var total int64
 
-		for {
+		for want > 0 {
 			res, err := scroll.Do(ctx)
 			if err == io.EOF {
 				break
@@ -278,12 +283,17 @@ func (e *ElasticChannelParticipantsDAO) GetUserAdmins(channelID int32, limit, of
 				}
 				var doc ChannelParticipantsDO
 				if err := json.Unmarshal(h.Source, &doc); err != nil {
-					fmt.Println("Unmarshal data err:", err)
 					continue
 				}
 				items = append(items, doc)
+				want--
+				if want == 0 {
+					break
+				}
 			}
 		}
+		duration := time.Since(timeStart)
+		fmt.Printf("Thời gian thực thi của hàm GetUserAdmins (scroll): %s - total: %d \n", duration, total)
 		return items, int32(total), nil
 	}
 
@@ -445,6 +455,7 @@ func (e *ElasticChannelParticipantsDAO) SetVersion(channelID int32, version int3
 // Đặt version = -1 để tự động tăng.
 // Đặt version = 0 để bỏ qua.
 func (e *ElasticChannelParticipantsDAO) DeleteUsers(channelID int32, version int32, listUserID []int32) error {
+	timeStart := time.Now()
 	if e == nil || e.client == nil {
 		return fmt.Errorf("DAO/client is nil")
 	}
@@ -472,12 +483,22 @@ func (e *ElasticChannelParticipantsDAO) DeleteUsers(channelID int32, version int
 			terms[j] = uid
 		}
 
-		q := elastic.NewBoolQuery().Filter(elastic.NewTermsQuery("user_id", terms...))
+		// Nên filter thêm channel_id để an toàn
+		q := elastic.NewBoolQuery().
+			Filter(
+				elastic.NewTermQuery("channel_id", channelID),
+				elastic.NewTermsQuery("user_id", terms...),
+			)
+
 		resp, err := e.client.DeleteByQuery(indexName).
 			Query(q).
 			Routing(route).
 			Conflicts("proceed").
-			Refresh("wait_for").
+			// Refresh chỉ nhận true/false cho delete_by_query
+			Refresh("true"). // hoặc .Refresh("false") / bỏ hẳn
+			WaitForCompletion(true).
+			// (tùy chọn) tăng tốc bằng slicing:
+			// Slices(4).
 			Do(ctx)
 		if err != nil {
 			return fmt.Errorf("delete by query failed: %w", err)
@@ -491,6 +512,7 @@ func (e *ElasticChannelParticipantsDAO) DeleteUsers(channelID int32, version int
 	if err := e.SetVersion(channelID, version); err != nil {
 		return fmt.Errorf("set version after delete failed: %w", err)
 	}
+	fmt.Printf("DeleteUsers completed. Time: %s\n", time.Since(timeStart))
 	return nil
 }
 

@@ -30,10 +30,13 @@ func main() {
 	// LoadAllData()
 
 	// Lấy dữ liệu
-	GetData()
+	// GetData()
 
 	// Cập nhật dữ liệu
-	UpdateUser()
+	// UpdateUser()
+
+	// Xoá dữ liệu
+	DeleteUser()
 }
 
 // ===================================================================================
@@ -44,7 +47,7 @@ func sampleData(channelID int32, size int, idStart int) ([]repo.ElasticChannelPa
 	data := []repo.ElasticChannelParticipantsDO{}
 	litsUserID := []int32{}
 
-	for i := idStart; i <= size; i++ {
+	for i := idStart; i <= idStart+size; i++ {
 		doc := &repo.ElasticChannelParticipantsDO{
 			ID:                int64(i),
 			ChannelID:         channelID,
@@ -131,59 +134,68 @@ func LoadAllData() {
 	fmt.Println("Migrate data completed! Time to Migrate Data: ", time.Since(timeStart).Milliseconds(), "ms")
 }
 
-// Thêm người dùng
-// func AddUsser() {
-// 	fmt.Println("----------------------- Test Add User Scenario ----------------------------")
-// 	newUsers, _ := sampleData(channelID, 10, 500001)
-// 	newChannlParticipant := repo.ElasticChannleParticipantsDO{
-// 		Version:      -1,
-// 		Participants: newUsers,
-// 	}
-// 	elaC.AddUpsertData(channelID, &newChannlParticipant)
+func DeleteUser() {
+	fmt.Println("----------------------- Delete Data ----------------------------")
+	/*
+		// Xoá 5K user - time:  489.2807ms
+		// Xoá 10K user - time:  780.8454ms
+		// Xoá 20K user - time:  2.058794s
+		// Xoá 50K user - time:  3.4990352s
+		// Xoá 100K user - time:  6.3435948s
+	*/
+	_, deleteDataID := sampleData(channelID, 100000, 95001)
+	println("Deleted 1000 users")
+	err := elaC.DeleteUsers(channelID+3, -1, deleteDataID)
+	if err != nil {
+		fmt.Println("DeleteUsers Err: ", err)
+		return
+	}
 
-// 	meta, err := elaC.SelectMetaData(channelID)
-// 	if err != nil {
-// 		fmt.Println("LoadAllData Err: ", err)
-// 	}
-// 	fmt.Println("SelectMetaData: ", *meta)
-// }
-
-// Triển khai kịch bản xóa người dùng:
-// - Xóa 1 người dùng
-// - Xóa nhiều người
-func DeleteUser() {}
+	if ok := redisC.DeleteUsers(channelID, deleteDataID); !ok {
+		fmt.Println("DeleteUsers Err!")
+	}
+	if err := redisC.DeleteString(channelID, deleteDataID); err != nil {
+		fmt.Println("DeleteUsersString Err!")
+	}
+}
 
 // Triển khai kịch bản cập nhật:
 // - Cập nhật thông tin của user mà không update version
 // - Cập nhật thông tin của users cùng version
 func UpdateUser() {
 	fmt.Println("----------------------- Update Data ----------------------------")
-
 	/*
-		// Cập nhật 1 user - process: 1	time:  153 ms
-		// Cập nhật 10 user - process: 1	time:  218 ms
-		// Cập nhật 100 user - process: 1	time:  293 ms
-		// Cập nhật 500 user - process: 1	time:  410 ms
-		// Cập nhật 1000 user - process: 1	time:  573 ms
+		add:
+			- 30K user	time: 3.2872372s - redisADD: 73.5411ms - redisString: 125.8157ms
+			- 20K user	time: 3.0698894s - redisADD: 54.4387ms - redisString: 175.422ms
+			- 10K user	time: 1.7960487s - redisADD: 48.6801ms - redisString: 113.255ms
+		update:
+			- 20K user	time: 3.1086109s - redisADD: 53.742ms - redisString: 134.6658ms
+			- 20K user	time: 3.0211374s - redisADD: 65.094ms - redisString: 132.5555ms
+			- 10K user	time: 1.9655146s - redisADD: 53.9629ms - redisString: 124.6259ms
+		reload:
+			- 60K user	time: 2.4188929s - redisADD: 81.9411ms - redisString: 4.9553ms
+			- 50K user	time: 2.6445956s - redisADD: 73.9882ms - redisString: 4.9268ms
+			- 40K user	time: 2.6665839s - redisADD: 61.8861ms - redisString: 4.0308ms
 	*/
 
-	newData, newDataID := sampleData(channelID, 1000, 500001)
-	updateData, _ := sampleData(channelID, 1000, 1)
+	newData, newDataID := sampleData(channelID, 30000, 500001)
+	updateData, newUpdateID := sampleData(channelID, 30000, 1)
 
-	// update với version tự động tăng
+	// Thêm với version tự động tăng
 	println("Added new 1000 users")
 	err := elaC.AddDataToCache(channelID, -1, newData)
 	if err != nil {
 		fmt.Println("AddDataToCache Err: ", err)
 	}
-	if ok := redisC.SaveAllData(channelID, newDataID); !ok {
-		fmt.Println("SaveAllData Err!")
+	if ok := redisC.AddUsers(channelID, newDataID); !ok {
+		fmt.Println("AddUsers Err!")
 	}
-	if err := redisC.SaveString(channelID, newDataID); err != nil {
-		fmt.Println("SaveString Err!")
+	if err := redisC.AddUsersString(channelID, newDataID); err != nil {
+		fmt.Println("AddUsersString Err!")
 	}
-	
-	// update với version giữ nguyên
+
+	// update với version
 	println("Updated 1000 existing users")
 	err = elaC.AddDataToCache(channelID+1, 10, updateData)
 	if err != nil {
@@ -191,11 +203,27 @@ func UpdateUser() {
 		return
 	}
 
-	if ok := redisC.SaveAllData(channelID+1, newDataID); !ok {
-		fmt.Println("SaveAllData Err!")
+	if ok := redisC.AddUsers(channelID+1, newUpdateID); !ok {
+		fmt.Println("AddUsers Err!")
+	}
+	if err := redisC.AddUsersString(channelID+1, newUpdateID); err != nil {
+		fmt.Println("AddUsersString Err!")
 	}
 
-
+	// update với dữ liệu mới (reset lại toàn bảng)
+	println("reset 1000 existing users")
+	reloadData, reloadDataID := sampleData(channelID+2, 60000, 32001)
+	err = elaC.SaveAllUsers(channelID+3, -1, reloadData)
+	if err != nil {
+		fmt.Println("SaveAllUsers Err: ", err)
+		return
+	}
+	if ok := redisC.SaveAllData(channelID+3, reloadDataID); !ok {
+		fmt.Println("SaveAllData Err!")
+	}
+	if err := redisC.SaveString(channelID+3, reloadDataID); err != nil {
+		fmt.Println("SaveString Err!")
+	}
 }
 
 // Triển khai kịch bản
@@ -203,7 +231,13 @@ func GetData() {
 	fmt.Println("----------------------- Get Data ----------------------------")
 	// timeStart := time.Now()
 
-	_, _, err := elaC.GetUserAdmins(channelID, 10000, 0)
+	/*
+		30K user - time:  1.7023381s - redisGetList: 128.2418ms - redisGetString: 34.4374ms
+		20K user - time:  1.1935404s - redisGetList: 143.577ms - redisGetString: 31.2439ms
+		10K user - time:  502.5181ms - redisGetList: 125.0407ms - redisGetString: 27.7333ms
+	*/
+
+	_, _, err := elaC.GetUserAdmins(channelID, 30000, 0)
 	if err != nil {
 		fmt.Println("err get list: ", err)
 	}

@@ -21,7 +21,17 @@ func NewChannelParticipantsCacheDAO() *ChannelParticipantsCacheDAO {
 
 func (r *ChannelParticipantsCacheDAO) SaveAllData(channelID int32, listUsers []int32) bool {
 	timeStart := time.Now()
+	if r == nil || r.conn == nil {
+		log.Printf("redis client is nil")
+		return false
+	}
 	key := fmt.Sprintf("channel:%d:participants", channelID)
+
+	// Xóa key cũ để reset toàn bộ
+	if err := r.conn.Del(key).Err(); err != nil {
+		log.Printf("Redis DEL error: %v", err)
+		return false
+	}
 
 	// chuyển []int32 → []interface{}
 	members := make([]interface{}, len(listUsers))
@@ -29,13 +39,13 @@ func (r *ChannelParticipantsCacheDAO) SaveAllData(channelID int32, listUsers []i
 		members[i] = u
 	}
 
-	// SADD: thêm toàn bộ user vào set
+	// SADD: thêm toàn bộ user mới vào set
 	if err := r.conn.SAdd(key, members...).Err(); err != nil {
 		log.Printf("Redis SAdd error: %v", err)
 		return false
-	} else {
-		log.Printf("✅ Redis Inserted %d users into %s", len(listUsers), key)
 	}
+
+	// log.Printf("✅ Redis Reset and Inserted %d users into %s", len(listUsers), key)
 
 	duration := time.Since(timeStart)
 	fmt.Printf("Thời gian thực thi của hàm SaveAllData: %s\n", duration)
@@ -90,6 +100,7 @@ func (r *ChannelParticipantsCacheDAO) GetList(channelID int32) ([]int32, bool) {
 }
 
 func (r *ChannelParticipantsCacheDAO) DeleteUsers(channelID int32, userIDs []int32) bool {
+	timeStart := time.Now()
 	if r == nil || r.conn == nil {
 		log.Printf("redis client is nil")
 		return false
@@ -131,10 +142,40 @@ func (r *ChannelParticipantsCacheDAO) DeleteUsers(channelID int32, userIDs []int
 	// 	}
 	// }
 
+	duration := time.Since(timeStart)
+	fmt.Printf("Thời gian thực thi của hàm DeleteUsers: %s\n", duration)
 	return true
 }
 
-func (r *ChannelParticipantsCacheDAO) UpsertUsers(channelID int32, userIDs []int32) bool {
+func (r *ChannelParticipantsCacheDAO) AddUsers(channelID int32, userIDs []int32) bool {
+	timeStart := time.Now()
+	if r == nil || r.conn == nil {
+		log.Printf("redis client is nil")
+		return false
+	}
+	key := fmt.Sprintf("channel:%d:participants", channelID)
+
+	if len(userIDs) == 0 {
+		log.Printf("⚠️ AddUsers: empty input for key %s, skip SADD", key)
+		return true
+	}
+
+	// chuyển []int32 → []interface{}
+	members := make([]interface{}, len(userIDs))
+	for i, u := range userIDs {
+		members[i] = u
+	}
+
+	// SADD: thêm toàn bộ user mới vào set
+	if err := r.conn.SAdd(key, members...).Err(); err != nil {
+		log.Printf("Redis SAdd error: %v", err)
+		return false
+	}
+
+	log.Printf("✅ Redis Upserted %d users into %s", len(userIDs), key)
+
+	duration := time.Since(timeStart)
+	fmt.Printf("Thời gian thực thi của hàm AddUsers: %s\n", duration)
 	return true
 }
 
@@ -146,10 +187,18 @@ func (r *ChannelParticipantsCacheDAO) SaveString(channelID int32, userIDs []int3
 	}
 	key := fmt.Sprintf("channel:%d:participants:str", channelID)
 
+	// Nếu key đã tồn tại thì xóa trước để "reset"
+	if exists, err := r.conn.Exists(key).Result(); err == nil && exists > 0 {
+		if delErr := r.conn.Del(key).Err(); delErr != nil {
+			return fmt.Errorf("redis DEL error: %w", delErr)
+		}
+	} else if err != nil {
+		return fmt.Errorf("redis EXISTS error: %w", err)
+	}
+
 	// Build CSV trong memory
 	var b strings.Builder
-	// ước lượng dung lượng để giảm realloc (10 ký tự/id + 1 dấu phẩy)
-	b.Grow(len(userIDs) * 11)
+	b.Grow(len(userIDs) * 11) // ước lượng dung lượng
 
 	for i, id := range userIDs {
 		if i > 0 {
@@ -203,8 +252,128 @@ func (r *ChannelParticipantsCacheDAO) GetString(channelID int32) ([]int32, error
 	return out, nil
 }
 
-func (r *ChannelParticipantsCacheDAO) UpsertString(channelID int32, userIDs []int32) ([]int32, error) {
-	return nil, nil
+func (r *ChannelParticipantsCacheDAO) AddUsersString(channelID int32, userIDs []int32) error {
+	timeStart := time.Now()
+	if r == nil || r.conn == nil {
+		return fmt.Errorf("redis client is nil")
+	}
+	key := fmt.Sprintf("channel:%d:participants:str", channelID)
+
+	// Lấy dữ liệu cũ từ Redis
+	raw, err := r.conn.Get(key).Result()
+	if err != nil && err != redis.Nil {
+		return fmt.Errorf("redis GET error: %w", err)
+	}
+
+	// Parse dữ liệu cũ thành map để check trùng
+	existing := make(map[int32]struct{})
+	if raw != "" {
+		parts := strings.Split(raw, ",")
+		for _, s := range parts {
+			if s == "" {
+				continue
+			}
+			v, convErr := strconv.ParseInt(s, 10, 32)
+			if convErr == nil {
+				existing[int32(v)] = struct{}{}
+			}
+		}
+	}
+
+	// Thêm userIDs mới (nếu chưa có)
+	for _, id := range userIDs {
+		if _, ok := existing[id]; !ok {
+			existing[id] = struct{}{}
+		}
+	}
+
+	// Build lại CSV từ map
+	var b strings.Builder
+	b.Grow(len(existing) * 11)
+	first := true
+	for id := range existing {
+		if !first {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.FormatInt(int64(id), 10))
+		first = false
+	}
+
+	// Lưu lại vào Redis
+	if err := r.conn.Set(key, b.String(), 0).Err(); err != nil {
+		return fmt.Errorf("redis SET error: %w", err)
+	}
+
+	duration := time.Since(timeStart)
+	fmt.Printf("Thời gian thực thi của hàm AddUsersString: %s\n", duration)
+	return nil
+}
+
+func (r *ChannelParticipantsCacheDAO) DeleteString(channelID int32, userIDs []int32) error {
+	timeStart := time.Now()
+
+	if r == nil || r.conn == nil {
+		return fmt.Errorf("redis client is nil")
+	}
+	key := fmt.Sprintf("channel:%d:participants:str", channelID)
+
+	raw, err := r.conn.Get(key).Result()
+	if err == redis.Nil {
+		return nil // chưa có key
+	}
+	if err != nil {
+		return fmt.Errorf("redis GET error: %w", err)
+	}
+	if raw == "" {
+		return nil
+	}
+
+	// Parse thành map để xóa nhanh
+	parts := strings.Split(raw, ",")
+	out := make(map[int32]struct{}, len(parts))
+	for _, s := range parts {
+		if s == "" {
+			continue
+		}
+		v, convErr := strconv.ParseInt(s, 10, 32)
+		if convErr != nil {
+			continue
+		}
+		out[int32(v)] = struct{}{}
+	}
+
+	// Xóa các userIDs cần remove
+	for _, id := range userIDs {
+		delete(out, id)
+	}
+
+	// Build lại CSV string từ map
+	if len(out) == 0 {
+		// Nếu không còn user nào → xóa luôn key
+		if delErr := r.conn.Del(key).Err(); delErr != nil {
+			return fmt.Errorf("redis DEL error: %w", delErr)
+		}
+	} else {
+		var b strings.Builder
+		b.Grow(len(out) * 11)
+
+		first := true
+		for id := range out {
+			if !first {
+				b.WriteByte(',')
+			}
+			b.WriteString(strconv.FormatInt(int64(id), 10))
+			first = false
+		}
+
+		if setErr := r.conn.Set(key, b.String(), 0).Err(); setErr != nil {
+			return fmt.Errorf("redis SET error: %w", setErr)
+		}
+	}
+
+	duration := time.Since(timeStart)
+	fmt.Printf("Thời gian thực thi của hàm DeleteString: %s\n", duration)
+	return nil
 }
 
 // ConnectRedis khởi tạo kết nối Redis (go-redis cũ, không dùng context trong Ping()).
